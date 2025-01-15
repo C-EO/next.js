@@ -1,15 +1,14 @@
 import Image from "next/image";
-import localFont from "next/font/local";
+import { Geist, Geist_Mono } from "next/font/google";
 
-const geistSans = localFont({
-  src: "./fonts/GeistVF.woff",
+const geistSans = Geist({
   variable: "--font-geist-sans",
-  weight: "100 900",
+  subsets: ["latin"],
 });
-const geistMono = localFont({
-  src: "./fonts/GeistMonoVF.woff",
+
+const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
-  weight: "100 900",
+  subsets: ["latin"],
 });
 
 export default function Home() {
@@ -32,6 +31,7 @@ export default function Home() {
             <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
               pages/index.js
             </code>
+            .
           </li>
           <li>Save and see your changes instantly.</li>
         </ol>
@@ -71,7 +71,7 @@ export default function Home() {
         >
           <Image
             aria-hidden
-            src="/file-text.svg"
+            src="/file.svg"
             alt="File icon"
             width={16}
             height={16}
