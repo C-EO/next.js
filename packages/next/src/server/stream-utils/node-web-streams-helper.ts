@@ -73,14 +73,45 @@ export function streamFromString(str: string): ReadableStream<Uint8Array> {
   })
 }
 
-export async function streamToString(
+export function streamFromBuffer(chunk: Buffer): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunk)
+      controller.close()
+    },
+  })
+}
+
+export async function streamToBuffer(
   stream: ReadableStream<Uint8Array>
+): Promise<Buffer> {
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) {
+      break
+    }
+
+    chunks.push(value)
+  }
+
+  return Buffer.concat(chunks)
+}
+
+export async function streamToString(
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal
 ): Promise<string> {
   const decoder = new TextDecoder('utf-8', { fatal: true })
   let string = ''
 
-  // @ts-expect-error TypeScript gets this wrong (https://nodejs.org/api/webstreams.html#async-iteration)
   for await (const chunk of stream) {
+    if (signal?.aborted) {
+      return string
+    }
+
     string += decoder.decode(chunk, { stream: true })
   }
 
@@ -108,6 +139,7 @@ export function createBufferedTransformStream(): TransformStream<
       try {
         const chunk = new Uint8Array(bufferByteLength)
         let copiedBytes = 0
+
         for (let i = 0; i < bufferedChunks.length; i++) {
           const bufferedChunk = bufferedChunks[i]
           chunk.set(bufferedChunk, copiedBytes)
@@ -146,21 +178,6 @@ export function createBufferedTransformStream(): TransformStream<
   })
 }
 
-function createInsertedHTMLStream(
-  getServerInsertedHTML: () => Promise<string>
-): TransformStream<Uint8Array, Uint8Array> {
-  return new TransformStream({
-    transform: async (chunk, controller) => {
-      const html = await getServerInsertedHTML()
-      if (html) {
-        controller.enqueue(encoder.encode(html))
-      }
-
-      controller.enqueue(chunk)
-    },
-  })
-}
-
 export function renderToInitialFizzStream({
   ReactDOMServer,
   element,
@@ -168,7 +185,7 @@ export function renderToInitialFizzStream({
 }: {
   ReactDOMServer: typeof import('react-dom/server.edge')
   element: React.ReactElement
-  streamOptions?: any
+  streamOptions?: Parameters<typeof ReactDOMServer.renderToReadableStream>[1]
 }): Promise<ReactReadableStream> {
   return getTracer().trace(AppRenderSpan.renderToReadableStream, async () =>
     ReactDOMServer.renderToReadableStream(element, streamOptions)
@@ -179,7 +196,6 @@ function createHeadInsertionTransformStream(
   insert: () => Promise<string>
 ): TransformStream<Uint8Array, Uint8Array> {
   let inserted = false
-  let freezing = false
 
   // We need to track if this transform saw any bytes because if it didn't
   // we won't want to insert any server HTML at all
@@ -188,32 +204,35 @@ function createHeadInsertionTransformStream(
   return new TransformStream({
     async transform(chunk, controller) {
       hasBytes = true
-      // While react is flushing chunks, we don't apply insertions
-      if (freezing) {
-        controller.enqueue(chunk)
-        return
-      }
 
       const insertion = await insert()
-
       if (inserted) {
         if (insertion) {
           const encodedInsertion = encoder.encode(insertion)
           controller.enqueue(encodedInsertion)
         }
         controller.enqueue(chunk)
-        freezing = true
       } else {
         // TODO (@Ethan-Arrowood): Replace the generic `indexOfUint8Array` method with something finely tuned for the subset of things actually being checked for.
         const index = indexOfUint8Array(chunk, ENCODED_TAGS.CLOSED.HEAD)
+        // In fully static rendering or non PPR rendering cases:
+        // `/head>` will always be found in the chunk in first chunk rendering.
         if (index !== -1) {
           if (insertion) {
             const encodedInsertion = encoder.encode(insertion)
+            // Get the total count of the bytes in the chunk and the insertion
+            // e.g.
+            // chunk = <head><meta charset="utf-8"></head>
+            // insertion = <script>...</script>
+            // output = <head><meta charset="utf-8"> [ <script>...</script> ] </head>
             const insertedHeadContent = new Uint8Array(
               chunk.length + encodedInsertion.length
             )
+            // Append the first part of the chunk, before the head tag
             insertedHeadContent.set(chunk.slice(0, index))
+            // Append the server inserted content
             insertedHeadContent.set(encodedInsertion, index)
+            // Append the rest of the chunk
             insertedHeadContent.set(
               chunk.slice(index),
               index + encodedInsertion.length
@@ -222,17 +241,20 @@ function createHeadInsertionTransformStream(
           } else {
             controller.enqueue(chunk)
           }
-          freezing = true
+          inserted = true
+        } else {
+          // This will happens in PPR rendering during next start, when the page is partially rendered.
+          // When the page resumes, the head tag will be found in the middle of the chunk.
+          // Where we just need to append the insertion and chunk to the current stream.
+          // e.g.
+          // PPR-static: <head>...</head><body> [ resume content ] </body>
+          // PPR-resume: [ insertion ] [ rest content ]
+          if (insertion) {
+            controller.enqueue(encoder.encode(insertion))
+          }
+          controller.enqueue(chunk)
           inserted = true
         }
-      }
-
-      if (!inserted) {
-        controller.enqueue(chunk)
-      } else {
-        scheduleImmediate(() => {
-          freezing = false
-        })
       }
     },
     async flush(controller) {
@@ -354,17 +376,15 @@ function createMergedTransformStream(
   })
 }
 
+const CLOSE_TAG = '</body></html>'
+
 /**
  * This transform stream moves the suffix to the end of the stream, so results
  * like `</body></html><script>...</script>` will be transformed to
  * `<script>...</script></body></html>`.
  */
-function createMoveSuffixStream(
-  suffix: string
-): TransformStream<Uint8Array, Uint8Array> {
+function createMoveSuffixStream(): TransformStream<Uint8Array, Uint8Array> {
   let foundSuffix = false
-
-  const encodedSuffix = encoder.encode(suffix)
 
   return new TransformStream({
     transform(chunk, controller) {
@@ -372,13 +392,13 @@ function createMoveSuffixStream(
         return controller.enqueue(chunk)
       }
 
-      const index = indexOfUint8Array(chunk, encodedSuffix)
+      const index = indexOfUint8Array(chunk, ENCODED_TAGS.CLOSED.BODY_AND_HTML)
       if (index > -1) {
         foundSuffix = true
 
         // If the whole chunk is the suffix, then don't write anything, it will
         // be written in the flush.
-        if (chunk.length === suffix.length) {
+        if (chunk.length === ENCODED_TAGS.CLOSED.BODY_AND_HTML.length) {
           return
         }
 
@@ -388,9 +408,11 @@ function createMoveSuffixStream(
 
         // In the case where the suffix is in the middle of the chunk, we need
         // to split the chunk into two parts.
-        if (chunk.length > suffix.length + index) {
+        if (chunk.length > ENCODED_TAGS.CLOSED.BODY_AND_HTML.length + index) {
           // Write out the part after the suffix.
-          const after = chunk.slice(index + suffix.length)
+          const after = chunk.slice(
+            index + ENCODED_TAGS.CLOSED.BODY_AND_HTML.length
+          )
           controller.enqueue(after)
         }
       } else {
@@ -400,7 +422,7 @@ function createMoveSuffixStream(
     flush(controller) {
       // Even if we didn't find the suffix, the HTML is not valid if we don't
       // add it, so insert it at the end.
-      controller.enqueue(encodedSuffix)
+      controller.enqueue(ENCODED_TAGS.CLOSED.BODY_AND_HTML)
     },
   })
 }
@@ -500,8 +522,8 @@ function chainTransformers<T>(
 export type ContinueStreamOptions = {
   inlinedDataStream: ReadableStream<Uint8Array> | undefined
   isStaticGeneration: boolean
-  getServerInsertedHTML: (() => Promise<string>) | undefined
-  serverInsertedHTMLToHead: boolean
+  getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
   validateRootLayout?: boolean
   /**
    * Suffix to inject after the buffered data, but before the close tags.
@@ -516,14 +538,12 @@ export async function continueFizzStream(
     inlinedDataStream,
     isStaticGeneration,
     getServerInsertedHTML,
-    serverInsertedHTMLToHead,
+    getServerInsertedMetadata,
     validateRootLayout,
   }: ContinueStreamOptions
 ): Promise<ReadableStream<Uint8Array>> {
-  const closeTag = '</body></html>'
-
   // Suffix itself might contain close tags at the end, so we need to split it.
-  const suffixUnclosed = suffix ? suffix.split(closeTag, 1)[0] : null
+  const suffixUnclosed = suffix ? suffix.split(CLOSE_TAG, 1)[0] : null
 
   // If we're generating static HTML and there's an `allReady` promise on the
   // stream, we need to wait for it to resolve before continuing.
@@ -535,10 +555,8 @@ export async function continueFizzStream(
     // Buffer everything to avoid flushing too frequently
     createBufferedTransformStream(),
 
-    // Insert generated tags to head
-    getServerInsertedHTML && !serverInsertedHTMLToHead
-      ? createInsertedHTMLStream(getServerInsertedHTML)
-      : null,
+    // Insert generated metadata
+    createHeadInsertionTransformStream(getServerInsertedMetadata),
 
     // Insert suffix content
     suffixUnclosed != null && suffixUnclosed.length > 0
@@ -552,24 +570,26 @@ export async function continueFizzStream(
     validateRootLayout ? createRootLayoutValidatorStream() : null,
 
     // Close tags should always be deferred to the end
-    createMoveSuffixStream(closeTag),
+    createMoveSuffixStream(),
 
     // Special head insertions
     // TODO-APP: Insert server side html to end of head in app layout rendering, to avoid
     // hydration errors. Remove this once it's ready to be handled by react itself.
-    getServerInsertedHTML && serverInsertedHTMLToHead
-      ? createHeadInsertionTransformStream(getServerInsertedHTML)
-      : null,
+    createHeadInsertionTransformStream(getServerInsertedHTML),
   ])
 }
 
 type ContinueDynamicPrerenderOptions = {
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { getServerInsertedHTML }: ContinueDynamicPrerenderOptions
+  {
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueDynamicPrerenderOptions
 ) {
   return (
     prerenderStream
@@ -578,72 +598,75 @@ export async function continueDynamicPrerender(
       .pipeThrough(createStripDocumentClosingTagsTransform())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
   )
 }
 
 type ContinueStaticPrerenderOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueStaticPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueStaticPrerenderOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueStaticPrerenderOptions
 ) {
-  const closeTag = '</body></html>'
-
   return (
     prerenderStream
       // Buffer everything to avoid flushing too frequently
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to head
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
+      .pipeThrough(createMoveSuffixStream())
   )
 }
 
 type ContinueResumeOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicHTMLResume(
   renderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueResumeOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueResumeOptions
 ) {
-  const closeTag = '</body></html>'
-
   return (
     renderStream
       // Buffer everything to avoid flushing too frequently
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to body
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
+      .pipeThrough(createMoveSuffixStream())
   )
 }
 
-type ContinueDynamicDataResumeOptions = {
-  inlinedDataStream: ReadableStream<Uint8Array>
-}
-
-export async function continueDynamicDataResume(
-  renderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream }: ContinueDynamicDataResumeOptions
-) {
-  const closeTag = '</body></html>'
-
-  return (
-    renderStream
-      // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
-      .pipeThrough(createMergedTransformStream(inlinedDataStream))
-      // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
-  )
+export function createDocumentClosingStream(): ReadableStream<Uint8Array> {
+  return streamFromString(CLOSE_TAG)
 }
